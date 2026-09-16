@@ -6,6 +6,9 @@ from airflow.providers.mongo.hooks.mongo import MongoHook
 from airflow.operators.python import PythonOperator
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # CONFIGURATION DU DAG
@@ -37,6 +40,11 @@ def migrate_table(sql_query, mongo_collection):
     cursor.execute(sql_query)
     rows = cursor.fetchall()
 
+    logger.info(
+        "[%s] %d lignes extraites depuis PostgreSQL",
+        mongo_collection, len(rows)
+    )
+
     # 2. Connexion à MongoDB
 
     mongo_hook = MongoHook(
@@ -53,7 +61,7 @@ def migrate_table(sql_query, mongo_collection):
 
     collection.drop()
 
-    # 4. Transformation + Insertion
+    # 4. Transformation
 
     documents = []
 
@@ -68,10 +76,33 @@ def migrate_table(sql_query, mongo_collection):
 
         documents.append(document)
 
+    # 5. Contrôle qualité : taux de valeurs NULL par champ
+
+    field_null_counts = {}
+
+    for document in documents:
+        for field, value in document.items():
+            if value is None:
+                field_null_counts[field] = field_null_counts.get(field, 0) + 1
+
+    for field, null_count in sorted(field_null_counts.items()):
+        logger.warning(
+            "[%s] champ '%s' : %d/%d valeurs NULL (%.1f%%)",
+            mongo_collection, field, null_count, len(documents),
+            null_count / len(documents) * 100
+        )
+
+    # 6. Insertion
+
     if documents:
         collection.insert_many(documents)
 
-    # 5. Fermeture des connexions
+    logger.info(
+        "[%s] chargement terminé : %d documents dans la collection",
+        mongo_collection, collection.count_documents({})
+    )
+
+    # 7. Fermeture des connexions
 
     cursor.close()
     connection.close()
