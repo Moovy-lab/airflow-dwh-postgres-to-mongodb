@@ -23,7 +23,7 @@ default_args = {
 # FONCTION GENERIQUE POSTGRESQL -> MONGODB
 
 
-def migrate_table(sql_query, mongo_collection, update_key):
+def migrate_table(sql_query, mongo_collection):
 
     # 1. Connexion à PostgreSQL
 
@@ -49,7 +49,13 @@ def migrate_table(sql_query, mongo_collection, update_key):
 
     collection = db[mongo_collection]
 
-    # 3. Transformation + Upsert
+    # 3. Rechargement complet de la collection
+
+    collection.drop()
+
+    # 4. Transformation + Insertion
+
+    documents = []
 
     for row in rows:
 
@@ -60,17 +66,12 @@ def migrate_table(sql_query, mongo_collection, update_key):
         else:
             document = data
 
-        query_filter = {
-            update_key: document.get(update_key)
-        }
+        documents.append(document)
 
-        collection.update_one(
-            query_filter,
-            {"$set": document},
-            upsert=True
-        )
+    if documents:
+        collection.insert_many(documents)
 
-    # 4. Fermeture des connexions
+    # 5. Fermeture des connexions
 
     cursor.close()
     connection.close()
@@ -286,8 +287,6 @@ with DAG(
                                     m.coefficient, \
                                     'id_DimTemps_Fk',
                                     temps.id_DimTemps, \
-                                    'id_DimEnseignant_Fk',
-                                    n.id_professeur, \
                                     'id_DimTypeEvaluation_FK',
                                     type_eval.id_DimTypeEvaluation, \
                                     'id_DimEtudiant_FK',
@@ -342,8 +341,6 @@ with DAG(
             "sql_query": sql_etudiant,
 
             "mongo_collection": "dim_etudiant",
-
-            "update_key": "id_etudiant",
         },
     )
 
@@ -360,8 +357,6 @@ with DAG(
             "sql_query": sql_enseignant,
 
             "mongo_collection": "dim_enseignant",
-
-            "update_key": "id_enseignant",
         },
     )
 
@@ -378,8 +373,6 @@ with DAG(
             "sql_query": sql_classe,
 
             "mongo_collection": "dim_classe",
-
-            "update_key": "id_classe",
         },
     )
 
@@ -396,8 +389,6 @@ with DAG(
             "sql_query": sql_matiere,
 
             "mongo_collection": "dim_matiere",
-
-            "update_key": "id_matiere",
         },
     )
 
@@ -414,8 +405,6 @@ with DAG(
             "sql_query": sql_temps,
 
             "mongo_collection": "dim_temps",
-
-            "update_key": "date_evaluation",
         },
     )
 
@@ -432,8 +421,6 @@ with DAG(
             "sql_query": sql_type_evaluation,
 
             "mongo_collection": "dim_type_evaluation",
-
-            "update_key": "type_evaluation",
         },
     )
 
@@ -450,8 +437,6 @@ with DAG(
             "sql_query": sql_fait_notes,
 
             "mongo_collection": "fait_notes",
-
-            "update_key": "id_fait",
         },
     )
 

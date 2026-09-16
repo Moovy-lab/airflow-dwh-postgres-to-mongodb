@@ -259,17 +259,14 @@ mongo_hook = MongoHook(
 )
 ```
 
-Les documents sont insérés ou mis à jour avec un mécanisme d'**upsert** :
+Chaque collection est **entièrement rechargée** à chaque exécution du DAG : la collection cible est d'abord vidée, puis repeuplée avec les documents fraîchement extraits :
 
 ```python
-collection.update_one(
-    query_filter,
-    {"$set": document},
-    upsert=True
-)
+collection.drop()
+collection.insert_many(documents)
 ```
 
-Cela permet d'éviter les doublons lors des exécutions successives du DAG.
+Cela garantit que le contenu de MongoDB reflète toujours exactement l'état courant de PostgreSQL (pas de doublons, pas de champs obsolètes qui subsisteraient d'une exécution précédente).
 
 ---
 
@@ -287,13 +284,14 @@ Exemple :
     "note": 14.5,
     "credit": 5,
     "id_DimTemps_Fk": 1,
-    "id_DimEnseignant_Fk": 2,
     "id_DimTypeEvaluation_FK": 1,
     "id_DimEtudiant_FK": "ETU001",
     "id_DimMatiere_FK": 3,
     "id_DimClasse_FK": 2
 }
 ```
+
+> ⚠️ **Pas de lien `fait_notes` → `dim_enseignant`.** Dans la base source, la table `NOTE` ne renseigne jamais `id_professeur` (colonne systématiquement `NULL`) : les données générées associent un professeur à une **matière** (table `ENSEIGNER`, relation many-to-many), jamais à une note individuelle. Il n'existe donc aucune façon fiable et non ambiguë de déduire l'enseignant d'une note précise. La dimension `dim_enseignant` est tout de même chargée (utile pour d'autres analyses, ex. charge d'enseignement par professeur), mais `fait_notes` ne la référence pas.
 
 ### Relations
 
@@ -302,11 +300,6 @@ id_DimEtudiant_FK
         │
         ▼
    dim_etudiant
-
-id_DimEnseignant_Fk
-        │
-        ▼
-   dim_enseignant
 
 id_DimMatiere_FK
         │
@@ -434,7 +427,7 @@ Port          : 27017
 Airflow/
 │
 ├── dags/
-│   └── dwh_scolaire_postgres_to_mongo.py
+│   └── dwh_scolaire_dag.py
 │
 ├── logs/
 │
