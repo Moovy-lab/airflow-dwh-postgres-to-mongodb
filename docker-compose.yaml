@@ -1,0 +1,125 @@
+name: airflow
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-meta:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.session
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+
+  user: "50000:0"
+
+  depends_on:
+    postgres-meta:
+      condition: service_healthy
+
+
+services:
+
+  # =========================================================
+  # PostgreSQL INTERNE À AIRFLOW
+  # =========================================================
+
+  postgres-meta:
+
+    image: postgres:13
+
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    restart: unless-stopped
+
+
+  # =========================================================
+  # INITIALISATION AIRFLOW
+  # =========================================================
+
+  airflow-init:
+    <<: *airflow-common
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username airflow \
+          --firstname Admin \
+          --lastname Airflow \
+          --role Admin \
+          --email airflow@example.com \
+          --password airflow || true
+    restart: "no"
+
+
+  # =========================================================
+  # AIRFLOW WEBSERVER
+  # =========================================================
+
+  airflow-webserver:
+
+    <<: *airflow-common
+
+    command: webserver
+
+    ports:
+      - "8080:8080"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "http://localhost:8080/health"
+        ]
+
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+    restart: unless-stopped
+
+
+  # =========================================================
+  # AIRFLOW SCHEDULER
+  # =========================================================
+
+  airflow-scheduler:
+
+    <<: *airflow-common
+
+    command: scheduler
+
+    restart: unless-stopped
+
+
+# ===========================================================
+# VOLUMES
+# ===========================================================
+
+volumes:
+
+  postgres-db-volume:
