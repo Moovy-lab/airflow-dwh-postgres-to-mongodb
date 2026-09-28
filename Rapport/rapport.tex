@@ -1,0 +1,259 @@
+﻿\documentclass[10pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage[margin=2cm]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=1.4em}
+\usepackage[hidelinks]{hyperref}
+\hypersetup{pdftitle={Data Warehouse scolaire : Airflow + Spark vers MongoDB}}
+
+\title{\textbf{Alimentation d'un Data Warehouse scolaire}\\%
+{\large Apache Airflow, Apache Spark et MongoDB}}
+\author{Projet -- Ingénierie de données}
+\date{Septembre 2026}
+
+\begin{document}
+
+\sloppy
+
+\maketitle
+\vspace{-2.2em}
+
+\begin{abstract}
+\noindent Ce rapport décrit la conception et la réalisation d'un \textbf{entrepôt de données (Data
+Warehouse)} à partir d'une base scolaire de gestion PostgreSQL. Un \textbf{DAG Airflow} déclenché
+quotidiennement reconstruit le modèle dimensionnel (six dimensions, une table de faits, deux
+agrégats) dans \textbf{MongoDB}. Les transformations lourdes et les agrégations sont déléguées à un
+cluster \textbf{Apache Spark} exécuté en conteneurs. Un \textbf{contrôle de qualité} portant sur les
+valeurs manquantes protège le chargement par un mécanisme de court-circuit. L'ensemble est
+conteneurisé avec Docker Compose et reproduit les étapes ETL \emph{extraction -- transformation --
+chargement} de manière automatisée et auditable.
+\end{abstract}
+
+\section{Contexte et objectifs}\label{sec:contexte}
+Un établissement gère ses données de scolarité (étudiants, classes, matières, professeurs,
+notes) dans une base PostgreSQL conçue pour l'\emph{exploitation}. Ce système, bien adapté aux
+écritures du quotidien, l'est moins à l'\emph{analyse} : schéma fortement normalisé, requêtes
+analytiques coûteuses, absence d'historisation et d'indicateurs prêts à l'emploi.
+
+Le projet répond à trois objectifs :
+\begin{enumerate}
+  \item construire un entrepôt de données (Data Warehouse) reflétant l'activité scolaire, selon
+        un modèle \emph{dimensionnel en étoile} ;
+  \item automatiser son alimentation par un pipeline ETL planifié et robuste ;
+  \item garantir la \emph{qualité} des données chargées (valeur ajoutée du processus).
+\end{enumerate}
+
+\section{Architecture globale}\label{sec:architecture}
+L'architecture (figure~\ref{fig:archi}) sépare la \textbf{source} (PostgreSQL), l'\textbf{orchestration}
+(Airflow), le \textbf{calcul distribué} (Spark) et la \textbf{cible} (MongoDB). Tous les services
+tournent en conteneurs Docker, à l'aide d'un \texttt{docker-compose.yaml} unique.
+
+\begin{figure}[h]
+  \centering
+  \begin{tikzpicture}[
+      box/.style={draw, minimum width=2.9cm, align=center, font=\small, inner sep=4pt},
+      src/.style={box, fill=blue!12},
+      comp/.style={box, fill=green!12},
+      tgt/.style={box, fill=orange!15},
+      arrow/.style={-{Stealth}, font=\scriptsize, align=center},
+      dlink/.style={-{Stealth}, dashed, gray}
+    ]
+    \node[src]                 (pg)     {PostgreSQL\\ \texttt{school}\\(source)};
+    \node[comp, right=1.3cm of pg] (af) {Apache Airflow\\ webserver + scheduler\\ \scriptsize(DAG, driver Spark)};
+    \node[comp, right=1.3cm of af] (mast) {Spark\\ Master};
+    \node[comp, below=0.9cm of mast] (work) {Spark Worker\\ \scriptsize 2 c\oe urs -- 1 Go};
+    \node[tgt, below=0.9cm of pg] (mg) {MongoDB\\ \texttt{dwh\_airflow}\\(cible)};
+
+    \draw[arrow] (pg) -- (af) node[midway, above] {JDBC / SQL};
+    \draw[arrow] (af) -- (mast) node[midway, above] {\texttt{spark-submit}};
+    \draw[arrow] (mast) -- (work) node[midway, right] {tâches};
+    \draw[arrow] (af) -- (mg) node[midway, left, align=center] {dimensions\\ QC \& faits\\(driver)};
+
+    \node[tgt, below=0.9cm of af, fill=gray!15] (meta) {Base de\\ métadonnées\\ (PostgreSQL)};
+    \draw[arrow] (af) -- (meta) node[midway, right] {Métadonnées};
+
+    \draw[dlink] (pg) -- ++(-1.6,0) node[left, align=left] {pgAdmin\\ (5050)};
+    \draw[dlink] (mg) -- ++(-1.6,0) node[left, align=left] {mongo-express\\ (8082)};
+    \draw[dlink] (af) -- ++(0,1.1) node[above] {UI Airflow -- 8080};
+  \end{tikzpicture}
+  \caption{Architecture du pipeline ETL (ports d'accès hôtes entre parenthèses).}
+  \label{fig:archi}
+\end{figure}
+
+Deux bases PostgreSQL coexistent : le \emph{moteur source} \texttt{school} (données de gestion) et la
+\emph{base interne} d'Airflow (métadonnées, DAGs, connexions). Le cluster Spark est en mode
+\textbf{standalone} : un master (port 7077) et un worker aux ressources volontairement modestes
+(2 cœurs, 1~Go). L'interface web Spark répond sur le port 8081.
+
+\paragraph{Choix des ports.} Les ports \texttt{5432} et \texttt{27017} étant utilisés par des
+installations locales, la source et la cible du projet sont exposées respectivement sur
+\texttt{5433} et \texttt{27018}. L'isolation ainsi garantie assure qu'aucune instance locale
+n'est modifiée par le pipeline.
+
+\section{Modèle dimensionnel}\label{sec:modele}
+Le schéma cible respecte le modèle \emph{en étoile} : le fait \texttt{fait\_notes} porte les mesures
+et référence six dimensions (tableau~\ref{tab:etoile}).
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{@{}llp{6.2cm}@{}}
+    \toprule
+    \textbf{Objet} & \textbf{Collection} & \textbf{Contenu / cardinalités} \\
+    \midrule
+    Dimensions & 6 collections \texttt{dim\_*} & étudiants (1000), enseignants (60),
+    matières (30), classes (24), jours (289), types (2). \\
+    \midrule
+    Faits & \texttt{fait\_notes} (23\,940) & une ligne par note : \texttt{note},
+    \texttt{credit} + clés \texttt{id\_Dim*\_FK}. \\
+    \midrule
+    Agrégats & \texttt{agg\_moyenne\_par\_matiere} (30) & moyenne des notes par matière. \\
+             & \texttt{agg\_moyenne\_par\_etudiant} (1000) & moyenne par étudiant. \\
+    \midrule
+    Qualité & \texttt{qc\_report} (1) & rapport de contrôle du dernier run. \\
+    \bottomrule
+  \end{tabular}
+  \caption{Collections produites par le pipeline.}
+  \label{tab:etoile}
+\end{table}
+
+Les identifiants de substitution (\emph{surrogate keys}) sont générés à la charge : les références
+temporelles et de type d'évaluation sont reconstruites dans Spark à l'aide de regroupements
+\emph{dense rank}. \emph{Remarque importante} : la table source \texttt{NOTE} possède un
+\texttt{id\_professeur} systématiquement vide ; la dimension enseignant n'est donc pas référencée
+par le fait (documenté, choix assumé).
+
+\section{Pipeline d'intégration (DAG)}\label{sec:pipeline}
+Le DAG \texttt{dwh\_scolaire\_postgres\_to\_mongo} est planifié à \texttt{@daily}
+(\texttt{catchup=False}), chaque tâche supportant un nouvel essai après 5 minutes. L'enchaînement
+(figure~\ref{fig:dag}) comprend neuf tâches.
+
+\begin{figure}[h]
+  \centering
+  \small
+  \begin{tikzpicture}[
+      t/.style={draw, rounded corners=2pt, fill=green!12, inner sep=3pt, font=\footnotesize},
+      arr/.style={-{Stealth}}
+    ]
+    \node[t] (d1) {load\_dim\_etudiant}; \node[t, right=6pt of d1] (d2) {load\_dim\_enseignant};
+    \node[t, right=6pt of d2] (d3) {load\_dim\_classe};
+    \node[t, below=8pt of d1] (d4) {load\_dim\_matiere}; \node[t, right=6pt of d4] (d5) {load\_dim\_temps};
+    \node[t, right=6pt of d5] (d6) {load\_dim\_type\_evaluation};
+    \node[t, below=14pt of d3, fill=gray!12] (qc) {run\_pyspark\_qc};
+    \node[t, below=8pt of qc, fill=yellow!20] (ck) {check\_qualite};
+    \node[t, below=8pt of ck, fill=orange!20] (ld) {run\_pyspark\_load};
+    \draw[arr] (d1) -- (qc); \draw[arr] (d2) -- (qc); \draw[arr] (d3) -- (qc);
+    \draw[arr] (d4) -- (qc); \draw[arr] (d5) -- (qc); \draw[arr] (d6) -- (qc);
+    \draw[arr] (qc) -- (ck); \draw[arr] (ck) -- (ld);
+  \end{tikzpicture}
+  \caption{Enchaînement des tâches du DAG.}
+  \label{fig:dag}
+\end{figure}
+
+\paragraph{Étape 1 -- Dimensions (SQL).} Six tâches \emph{PythonOperator} lisent les tables de
+gestion via un hook PostgreSQL, transforment chaque ligne en document JSON et écrivent par
+\texttt{replace\_many} (rechargement total) dans la collection cible. Les dimensions sont stables et
+peu volumineuses : un traitement SQL dédié suffit.
+
+\paragraph{Étape 2 -- Contrôle qualité (PySpark).} Le job \texttt{spark.py} (mode \texttt{qc})
+compte les notes, les valeurs manquantes et calcule un taux. Il consigne le résultat dans
+\texttt{qc\_report}. Avec le jeu fourni : 23\,940 notes, dont 730 valeurs absentes, soit un taux de
+3{,}05\,\% pour un seuil de 20\,\% : statut \textbf{OK}.
+
+\paragraph{Étape 3 -- Garde-fou.} \texttt{check\_qualite}, un \emph{ShortCircuitOperator}, relit le
+rapport : en l'absence de rapport ou en cas d'\emph{anomalie} déclarée, il interrompt le DAG ; toutes
+les tâches aval sont marquées \texttt{skipped}. Aucune donnée douteuse ne peut atteindre le
+chargement des faits.
+
+\paragraph{Étape 4 -- Chargement et agrégats (PySpark).} Le mode \texttt{load} relit \texttt{NOTE}
+par \textbf{JDBC partitionné} (colonne \texttt{id\_matiere}, jusqu'à quatre partitions en
+parallèle), joint les référentiels (matière, étudiant, classe), reconstruit les clés de substitution
+et écrit \texttt{fait\_notes} puis les deux collections d'indicateurs. L'écriture est réalisée
+\emph{depuis le driver} avec le client \texttt{pymongo}, par lots de 1\,000 documents, toujours en
+rechargement total (drop puis insert).
+
+\section{Résultats}\label{sec:resultats}
+Deux exécutions complètes du DAG ont été mesurées (déclenchement manuel et run planifié) :
+\begin{itemize}
+  \item \textbf{dimensions} : 6 collections chargées (cardinalités du tableau~\ref{tab:etoile}) ;
+  \item \textbf{faits} : \texttt{fait\_notes} (23\,940 documents) ;
+  \item \textbf{indicateur par matière} : \texttt{agg\_moyenne\_par\_matiere} (30) ;
+  \item \textbf{indicateur par étudiant} : \texttt{agg\_moyenne\_par\_etudiant} (1000) ;
+  \item \textbf{qualité} : rapport \texttt{OK} (3{,}05\,\% de valeurs manquantes $<$ seuil de
+        20\,\%) ; la barrière qualité a été vérifiée en abaissant provisoirement le seuil : le
+        chargement des faits a bien été court-circuité ;
+  \item \textbf{durées observées} (poste local) : contrôle qualité $\approx$ 1 min 30,
+        chargement des faits $\approx$ 4 min.
+\end{itemize}
+Le pipeline est \textbf{reproductible} (détail en section~\ref{sec:repro}). Deux interfaces de
+supervision complètent la livraison : pgAdmin (5050) et mongo-express (8082).
+
+\section{Mise en œuvre et reproductibilité}\label{sec:repro}
+L'environnement se déploie en trois commandes. L'initialisation de la base source est automatique
+au premier démarrage (rejeu du script \texttt{data/G2.sql}).
+
+\begin{verbatim}
+# 1. Construire l'image Airflow et démarrer toute la pile
+docker compose up -d
+
+# 2. Initialiser Airflow (base centrale + utilisateur admin)
+docker compose up airflow-init --wait
+
+# 3. Recréer les connexions (source, cible, Spark)
+docker compose exec airflow-scheduler bash /opt/airflow/scripts/init_connections.sh
+\end{verbatim}
+
+Le DAG est ensuite activé puis déclenché depuis l'interface Airflow (port 8080). Les échanges avec
+la source et le cluster reposent sur trois connexions Airflow (tableau~\ref{tab:connex}).
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Connexion} & \textbf{Type} & \textbf{Cible} \\
+    \midrule
+    \texttt{postgres\_default} & PostgreSQL & \texttt{postgres://school:school@postgres-source:5432/school} \\
+    \texttt{mongo\_default} & MongoDB & \texttt{mongodb://mongodb-dwh:27017} \\
+    \texttt{spark\_default} & Spark & host \texttt{spark://spark-master}, port \texttt{7077} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Connexions Airflow utilisées par le pipeline.}
+  \label{tab:connex}
+\end{table}
+
+\section{Limites et perspectives}\label{sec:limites}
+Les limites, documentées dans le rapport technique du dépôt, sont assumées :
+\begin{itemize}
+  \item \textbf{Rechargement total} : simple et cohérent, mais non incrémental ; un horodatage de
+        modification permettrait par la suite une charge incrémentale.
+  \item \textbf{Écriture côté driver} : les exécuteurs ne disposent pas de \texttt{pymongo} ; le
+        connecteur Spark-MongoDB officiel déplacerait cette écriture vers les exécuteurs.
+  \item \textbf{Identifiants de connexion} visibles dans la ligne de commande
+        \texttt{spark-submit} (acceptable en local ; un gestionnaire de secrets est prévu en
+        production).
+  \item \textbf{Agrégat global} (\texttt{dense\_rank}) ramène temporairement la donnée sur une
+        partition unique ; à grande échelle, une partition par clé de substitution s'imposerait.
+  \item \textbf{Volume traité} : modeste par choix ; l'architecture (lecture partitionnée, scale-out
+        Spark) est conçue pour monter en charge sans changement de code.
+\end{itemize}
+
+\section{Conclusion}\label{sec:conclusion}
+Le projet démontre la mise en \oe uvre complète d'une chaîne ETL moderne : orchestration planifiée
+(Airflow), calcul distribué (Spark/PySpark), transformation vers un modèle dimensionnel et
+chargement dans un entrepôt document MongoDB. Le contrôle qualité intégré et le court-circuit
+associé apportent la garantie métier que seules des données conformes alimentent l'entrepôt. La
+conteneurisation rend l'environnement reproductible et portable. Les pistes d'évolution identifiées
+(chargement incrémental, connecteur Spark officiel, secret management) dressent un plan
+d'amélioration réaliste vers une exploitation de production.
+
+\end{document}

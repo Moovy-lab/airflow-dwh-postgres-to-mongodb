@@ -1,0 +1,295 @@
+\documentclass[10pt]{beamer}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[french]{babel}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+
+\usetheme{Madrid}
+\usecolortheme{beaver}
+\setbeamertemplate{navigation symbols}{}
+
+\title[Data Warehouse scolaire]{Data Warehouse scolaire : Airflow + Spark vers MongoDB}
+\subtitle{ÉTI sur le Data Warehouse : dimensions, faits et contrôle qualité}
+\author[Équipe projet]{Projet -- Ingénierie de données}
+\date{Septembre 2026}
+
+\begin{document}
+
+% ---------------------------------------------------------------
+\begin{frame}
+  \titlepage
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Contexte et problématique}
+  \begin{itemize}
+    \item Une base \textbf{PostgreSQL} gère la scolarité : étudiants, classes, matières,
+          professeurs, notes (système \emph{d'exploitation}).
+    \item Ce système est mal adapté à l'\textbf{analyse} : schéma normalisé, requêtes lourdes,
+          pas d'indicateurs prêts à l'emploi.
+    \item Le projet doit fournir un \textbf{Data Warehouse} scolaire exploitable par une
+          direction (moyennes, taux de réussite).
+  \end{itemize}
+  \vfill
+  \begin{block}{Problématique}
+    Comment alimenter automatiquement un entrepôt de données fiable, à partir d'une base de
+    gestion, en garantissant la qualité des données ?
+  \end{block}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Objectifs}
+  \begin{enumerate}
+    \item \textbf{Modéliser} les données selon un schéma \emph{dimensionnel en étoile}
+          (6 dimensions + table de faits + indicateurs).
+    \item \textbf{Automatiser} l'alimentation par un \emph{pipeline ETL} planifié
+          (DAG Airflow $\rightarrow$ {\large\emph{@daily}}).
+    \item \textbf{Sécuriser} le chargement par un \emph{contrôle de qualité} avec
+          court-circuit automatique.
+    \item \textbf{Industrialiser} : calcul distribué (Spark), environnements reproductibles
+          (Docker Compose).
+  \end{enumerate}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Architecture cible}
+  \begin{center}
+  \begin{tikzpicture}[
+      box/.style={draw, minimum width=2.3cm, align=center, font=\small, inner sep=4pt},
+      src/.style={box, fill=blue!12},
+      comp/.style={box, fill=green!12},
+      tgt/.style={box, fill=orange!15},
+      arrow/.style={-{Stealth}, font=\scriptsize, align=center}
+    ]
+    \node[src]                        (pg)   {PostgreSQL\\ \scriptsize source\\ \texttt{school}};
+    \node[comp, right=0.9cm of pg]    (af)   {Apache\\ Airflow\\ \scriptsize DAG + driver};
+    \node[comp, right=0.9cm of af]    (sp)   {Cluster\\ Spark\\ \scriptsize master + worker};
+    \node[tgt, right=0.9cm of sp]     (mg)   {MongoDB\\ \scriptsize cible\\ \texttt{dwh\_airflow}};
+    \draw[arrow] (pg) -- (af) node[midway, above] {JDBC/SQL};
+    \draw[arrow] (af) -- (sp) node[midway, above] {\scriptsize spark-submit};
+    \draw[arrow] (sp) -- (mg) node[midway, above] {\scriptsize données\\ \scriptsize transformées};
+  \end{tikzpicture}
+  \end{center}
+  \vfill
+  \begin{itemize}
+    \item \textbf{Source} : PostgreSQL \texttt{school} (23\,940 notes, 1\,000 étudiants).
+    \item \textbf{Orchestration} : DAG \texttt{dwh\_scolaire\_postgres\_to\_mongo}.
+    \item \textbf{Calcul} : Spark standalone (2 cœurs, 1~Go -- volontairement modeste).
+    \item \textbf{Cible} : MongoDB \texttt{dwh\_airflow} (modèle document).
+  \end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Stack technique et rôles}
+  \scriptsize
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    \textbf{Outil} & \textbf{Rôle dans le projet} \\
+    \midrule
+    PostgreSQL 13 & base \emph{source} (gestion scolaire) + base de métadonnées d'Airflow \\
+    Apache Airflow 2.10 & orchestration, planification, dépendances, retries, court-circuit \\
+    Apache Spark 3.5 + PySpark & calcul distribué : contrôle qualité, faits, agrégats \\
+    MongoDB 7 & entrepôt cible (dimensions, faits, indicateurs, QC) \\
+    Docker Compose & 8~services conteneurisés, environnement reproductible \\
+    pymongo & écriture MongoDB depuis le driver (lots de 1\,000 documents) \\
+    JDBC (driver 42.7.3) & lecture partitionnée de la source dans Spark \\
+    Interfaces & Airflow UI 8080, Spark UI 8081, pgAdmin 5050, mongo-express 8082 \\
+    \bottomrule
+  \end{tabular}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Modèle dimensionnel (étoile)}
+  \begin{columns}
+    \begin{column}{0.52\textwidth}
+      \scriptsize
+      \begin{tabular}{@{}ll@{}}
+        \toprule
+        \textbf{Objet} & \textbf{Cardinalité} \\
+        \midrule
+        \texttt{dim\_etudiant} & 1\,000 \\
+        \texttt{dim\_enseignant} & 60 \\
+        \texttt{dim\_matiere} & 30 \\
+        \texttt{dim\_classe} & 24 \\
+        \texttt{dim\_temps} & 289 \\
+        \texttt{dim\_type\_evaluation} & 2 \\
+        \midrule
+        \textbf{\texttt{fait\_notes}} & \textbf{23\,940} \\
+        \midrule
+        \texttt{agg\_moyenne\_par\_matiere} & 30 \\
+        \texttt{agg\_moyenne\_par\_etudiant} & 1\,000 \\
+        \texttt{qc\_report} & 1 \\
+        \bottomrule
+      \end{tabular}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \begin{block}{Document \texttt{fait\_notes}}
+        \scriptsize
+        \texttt{\{ \\
+          ~~"id\_fait" : 17370,\\
+          ~~"note" : 12.73,\\
+          ~~"credit" : 3,\\
+          ~~"id\_DimEtudiant\_FK" : "ETU2025-00729",\\
+          ~~"id\_DimMatiere\_FK" : 7,\\
+          ~~"id\_DimClasse\_FK" : 1,\\
+          ~~"id\_DimTemps\_Fk" : 2,\\
+          ~~"id\_DimTypeEvaluation\_FK" : 2\\
+          \}}
+      \end{block}
+      Dimensions = axes d'analyse ; faits = mesures.
+      \emph{Note} : pas de dimension enseignant dans le fait
+      (source sans information de professeur par note).
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Pipeline du DAG}
+  \scriptsize
+  \begin{enumerate}
+    \item \textbf{Dimensions} (SQL) : 6 tâches parallèles chargent les référentiels
+          (drop + rechargement total, écriture \texttt{replace\_many}).
+    \item \textbf{Contrôle qualité} (PySpark) : \texttt{run\_pyspark\_qc} -- comptage,
+          valeurs manquantes, taux $<$ seuil 20\,\% (3{,}05\,\% mesurés) $\rightarrow$
+          rapport \textbf{OK}.
+    \item \textbf{Garde-fou} : \texttt{check\_qualite} (\emph{ShortCircuitOperator}) --
+          si anomalie, toutes les tâches aval passent en \texttt{skipped}.
+    \item \textbf{Chargement} (PySpark) : \texttt{run\_pyspark\_load} --
+          lecture JDBC partitionnée (sur \texttt{id\_matiere}), construction des clés de
+          substitution, \texttt{fait\_notes} + 2 agrégats, écriture par lots de
+          1\,000 (driver).
+  \end{enumerate}
+  \vspace{0.4em}
+  \begin{block}{Caractéristiques}
+    Planification \texttt{@daily}, \texttt{catchup=False}, 1 essai après 5 minutes ;
+    mode standalone, exécuteurs sur le worker, \emph{driver} dans le conteneur Airflow.
+  \end{block}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Contrôle qualité et court-circuit}
+  \begin{columns}
+    \begin{column}{0.55\textwidth}
+      \textbf{Mesures QC} (mode \texttt{qc}) :
+      \begin{itemize}
+        \item notes totales : \textbf{23\,940}
+        \item valeurs manquantes : \textbf{730}
+        \item taux : \textbf{3{,}05\,\%} $<$ seuil \textbf{20\,\%}
+        \item statut : \textbf{OK}
+      \end{itemize}
+      \vspace{0.4em}
+      \textbf{Mécanisme} : \texttt{ShortCircuitOperator} relit \texttt{qc\_report}.
+      \begin{itemize}
+        \item rapport absent $\rightarrow$ échec de la tâche ;
+        \item statut \texttt{ANOMALIE} $\rightarrow$ suite du DAG \texttt{skipped}.
+      \end{itemize}
+      \vspace{0.4em}
+      La barrière a été testée en abaissant le seuil : le charger de fait n'a pas été
+      relancé.
+    \end{column}
+    \begin{column}{0.45\textwidth}
+      \begin{alertblock}{Sans garde-fou}
+        Des notes manquantes à plus de 20\,\% alimenteraient un entrepôt faussé.
+      \end{alertblock}
+      \begin{block}{Avec garde-fou}
+        Seules des données conformes atteignent \texttt{fait\_notes} et les indicateurs.
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Résultats mesurés}
+  \begin{columns}
+    \begin{column}{0.55\textwidth}
+      \textbf{Exécutions validées} :
+      \begin{itemize}
+        \item run manuel + run planifié : pipelines \textbf{success} ;
+        \item 10 collections alimentées (intégralité du tableau vu plus haut) ;
+        \item report \texttt{qc\_report} final : \textbf{OK}.
+      \end{itemize}
+      \textbf{Reproducibilité} (3 commandes) :
+      \begin{itemize}
+        \item \texttt{docker compose up -d}
+        \item \texttt{docker compose up airflow-init --wait}
+        \item \texttt{init\_connections.sh} (connexions source, cible, Spark)
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.45\textwidth}
+      \begin{block}{Durées observées (local)}
+        \begin{itemize}
+          \item contrôle qualité : $\approx$ 1 min 30
+          \item chargement des faits : $\approx$ 4 min
+        \end{itemize}
+      \end{block}
+      \begin{block}{Accès}
+        Airflow UI 8080 · Spark UI 8081\\
+        pgAdmin 5050 · mongo-express 8082
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Points techniques clés}
+  \begin{itemize}
+    \item \textbf{JDBC} : le fichier \texttt{jars} ne suffit pas ; ajout de
+          \texttt{driver\_class\_path} car la lecture s'exécute dans le \emph{driver}.
+    \item \textbf{Connexion Spark} : le provider reconstruit l'URL en
+          \texttt{host:port} $\rightarrow$ le host doit contenir le schéma :
+          \texttt{spark://spark-master}, port 7077.
+    \item \textbf{Image Apache Spark} : scripts dans \texttt{/opt/spark/bin}
+          (et non \texttt{sbin}) ; lancement master/worker via \texttt{spark-class}.
+    \item \textbf{Healthcheck master} : \texttt{/bin/sh} = dash $\rightarrow$ test
+          \texttt{bash /dev/tcp}, sur le \emph{nom d'hôte}, pas 127.0.0.1.
+    \item \textbf{Écriture cible} : \texttt{pymongo} par lots de 1\,000, en
+          rechargement total (consistance garantie).
+  \end{itemize}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Limites et perspectives}
+  \begin{columns}
+    \begin{column}{0.5\textwidth}
+      \textbf{Limites assumées}
+      \begin{itemize}
+        \item rechargement \emph{total}, non incrémental ;
+        \item écriture MongoDB \emph{côté driver} (exécuteurs sans \texttt{pymongo}) ;
+        \item identifiants visibles dans la commande \texttt{spark-submit} ;
+        \item volume de test modeste (choix pédagogique).
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \textbf{Perspectives}
+      \begin{itemize}
+        \item chargement \emph{incrémental} (horodatage de modification) ;
+        \item \emph{connecteur Spark-MongoDB} officiel ;
+        \item \emph{gestionnaire de secrets} pour les connexions ;
+        \item ajout de workers pour monter en charge.
+      \end{itemize}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{Conclusion}
+  \begin{itemize}
+    \item Une chaîne ETL complète : \textbf{PostgreSQL $\rightarrow$ Airflow
+          $\rightarrow$ Spark $\rightarrow$ MongoDB}.
+    \item Le \textbf{contrôle qualité} intégré bloque le chargement en cas
+          d'anomalie (mécanisme de court-circuit).
+    \item Un environnement \textbf{conteneurisé} et reproductible, des UIs de
+          supervision intégrées.
+    \item Un plan d'évolution clair vers une exploitation de production
+          (incrémental, secrets, connecteur officiel).
+  \end{itemize}
+  \vfill
+  \begin{center}
+    \textbf{Merci pour votre attention -- questions ?}
+  \end{center}
+\end{frame}
+
+\end{document}
