@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.mongo.hooks.mongo import MongoHook
 from airflow.operators.python import PythonOperator
@@ -9,6 +10,9 @@ import json
 import logging
 
 logger = logging.getLogger(__name__)
+
+application='/opt/airflow-dwh-postgres-to-mongodb/dags/spark.py'
+
 
 
 # CONFIGURATION DU DAG
@@ -126,6 +130,16 @@ with DAG(
     catchup=False,
 
 ) as dag:
+
+    submit_spark_job = SparkSubmitOperator(
+        task_id='run_pyspark_job',
+        application='/airflow-dwh-postgres-to-mongodb/dags/spark.py',  # Chemin vers votre script PySpark accessible par le worker
+        conn_id='spark_default',
+        conf={'spark.master': 'spark://spark-master:7077'},
+        verbose=True
+    )
+
+    submit_spark_job
 
     # DIM_ETUDIANT
 
