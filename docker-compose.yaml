@@ -17,6 +17,8 @@ x-airflow-common: &airflow-common
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
+    - ./spark/jobs:/opt/airflow/spark/jobs
+    - ./scripts:/opt/airflow/scripts
 
   user: "50000:0"
 
@@ -52,24 +54,108 @@ services:
 
     restart: unless-stopped
 
+  # =========================================================
+  # POSTGRESQL SOURCE (base scolaire "school")
+  # =========================================================
+  postgres-source:
+
+    image: postgres:13
+
+    environment:
+      POSTGRES_USER: school
+      POSTGRES_PASSWORD: school
+      POSTGRES_DB: school
+
+    ports:
+      - "5433:5432"   # Accès depuis l'hôte (5432 est déjà pris par le Postgres local)
+
+    volumes:
+      - ./data:/docker-entrypoint-initdb.d:ro
+      - postgres-source-volume:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U school -d school"]
+
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    restart: unless-stopped
+
+    # =========================================================
+  # MONGODB (Data Warehouse)
+  # =========================================================
+  mongodb-dwh:
+
+    image: mongo:7
+
+    ports:
+      - "27018:27017" # 27017 est déjà pris par le MongoDB local
+
+    volumes:
+      - mongodb-dwh-volume:/data/db
+
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+
+      # mongosh (Node) est lent à démarrer : on lui laisse le temps
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 30s
+
+    restart: unless-stopped
+
     # =========================================================
   # SPARK MASTER
   # =========================================================
   spark-master:
     image: apache/spark:3.5.0
-    command: /opt/spark/sbin/spark-class org.apache.spark.deploy.master.Master
+    # NB : dans l'image apache/spark, les scripts sont dans /opt/spark/bin
+    # (et non /opt/spark/sbin comme dans la distribution binaire officielle).
+    # On lance le processus au premier plan (pas de daemon) pour Docker.
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
     ports:
-      - "8081:8080" # Interface Web Spark
+      - "8081:8080" # Interface Web Spark (master)
       - "7077:7077" # Port Master pour Airflow
+    healthcheck:
+      # /bin/sh est dash dans cette image : /dev/tcp impose bash.
+      # On teste le nom d'hote car le master ecoute sur son IP
+      # (et non sur 127.0.0.1) pour pouvoir s'annoncer aux workers.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/spark-master/7077"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
 
   # =========================================================
   # SPARK WORKER
   # =========================================================
   spark-worker:
     image: apache/spark:3.5.0
-    command: /opt/spark/sbin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --memory
+      - 1g
+      - --cores
+      - "2"
+      - spark://spark-master:7077
+    environment:
+      SPARK_WORKER_MEMORY: 1g
     depends_on:
-      - spark-master
+      spark-master:
+        condition: service_healthy
+    restart: unless-stopped
 
 
 
@@ -120,6 +206,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 90s # le webserver met ~80s à démarrer
 
     restart: unless-stopped
 
@@ -144,3 +231,5 @@ services:
 volumes:
 
   postgres-db-volume:
+  postgres-source-volume:
+  mongodb-dwh-volume:

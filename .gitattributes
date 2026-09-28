@@ -1,0 +1,12 @@
+* text=auto
+
+# Les fichiers executes dans les conteneurs Linux ne doivent jamais
+# recevoir de CRLF lors d'un checkout sous Windows.
+*.sh text eol=lf
+*.py text eol=lf
+*.sql text eol=lf
+Dockerfile text eol=lf
+docker-compose.yaml text eol=lf
+docker-compose.yml text eol=lf
+requirements.txt text eol=lf
+.gitattributes text eol=lf

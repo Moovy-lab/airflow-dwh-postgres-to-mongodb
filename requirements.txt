@@ -1,2 +1,7 @@
-apache-airflow-providers-postgres
-apache-airflow-providers-mongo
+# Versions alignees sur le Dockerfile (cf. ARG POSTGRES_JDBC_VERSION).
+apache-airflow-providers-postgres==5.12.0
+apache-airflow-providers-mongo==4.1.1
+apache-airflow-providers-apache-spark==4.1.3
+
+# Doit rester aligne sur l'image du cluster Spark (apache/spark:3.5.0).
+pyspark==3.5.0

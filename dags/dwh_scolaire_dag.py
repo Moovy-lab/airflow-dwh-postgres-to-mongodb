@@ -1,18 +1,17 @@
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from airflow.exceptions import AirflowFailException
+from airflow.hooks.base import BaseHook
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.mongo.hooks.mongo import MongoHook
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
 import json
 import logging
 
 logger = logging.getLogger(__name__)
-
-application='/opt/airflow-dwh-postgres-to-mongodb/dags/spark.py'
-
 
 
 # CONFIGURATION DU DAG
@@ -24,6 +23,88 @@ default_args = {
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
 }
+
+
+# CONFIGURATION SPARK
+
+PG_CONN_ID = "postgres_default"
+MONGO_CONN_ID = "mongo_default"
+SPARK_CONN_ID = "spark_default"
+
+DWH_DATABASE = "dwh_airflow"
+
+# L'URL du master Spark (spark://spark-master:7077) n'est pas un parametre de
+# SparkSubmitOperator : elle est lue dans la connexion Airflow SPARK_CONN_ID,
+# ou le provider la reconstruit a partir de host + port.
+
+# Chemins valables dans le conteneur Airflow (cf. volumes du docker-compose).
+SPARK_APPLICATION = "/opt/airflow/spark/jobs/spark.py"
+
+# Version du driver JDBC a faire correspondre a l'ARG POSTGRES_JDBC_VERSION du Dockerfile.
+SPARK_JDBC_VERSION = "42.7.3"
+SPARK_JDBC_JAR = f"file:///opt/airflow/spark/jars/postgresql-{SPARK_JDBC_VERSION}.jar"
+
+# Le chargement est court-circuite au-dela de ce taux de valeurs NULL.
+QC_MAX_NULL_RATE = 0.20
+
+
+def spark_arguments(mode):
+
+    # Les identifiants sont lus dans les connexions Airflow : une seule source de
+    # verite. Limite connue pour un projet local : ils apparaissent dans la ligne
+    # de commande du processus spark-submit, donc dans ps et dans l'UI Spark.
+    pg_conn = BaseHook.get_connection(PG_CONN_ID)
+    mongo_conn = BaseHook.get_connection(MONGO_CONN_ID)
+
+    pg_url = (
+        f"jdbc:postgresql://{pg_conn.host}:{pg_conn.port}/{pg_conn.schema}"
+    )
+
+    return [
+        "--mode", mode,
+        "--pg-url", pg_url,
+        "--pg-user", pg_conn.login,
+        "--pg-password", pg_conn.password,
+        "--mongo-uri", f"mongodb://{mongo_conn.host}:{mongo_conn.port}",
+        "--mongo-database", DWH_DATABASE,
+        "--qc-max-null-rate", str(QC_MAX_NULL_RATE),
+    ]
+
+
+# FONCTIONS DE CONTROLE QUALITE
+
+
+def check_data_quality():
+
+    client = MongoHook(mongo_conn_id=MONGO_CONN_ID).get_conn()
+
+    try:
+        rapport = client[DWH_DATABASE]["qc_report"].find_one({"_id": "dernier_rapport"})
+    finally:
+        client.close()
+
+    if rapport is None:
+        raise AirflowFailException(
+            "Aucun rapport de qualite n'a ete produit par le job Spark"
+        )
+
+    taux_null = rapport.get("valeur_null_rate", 1.0)
+
+    logger.info(
+        "Controle qualite : %s notes, taux de valeurs NULL %.2f%% (seuil %.2f%%)",
+        rapport.get("note_total"),
+        taux_null * 100,
+        rapport.get("seuil_null_rate", QC_MAX_NULL_RATE) * 100,
+    )
+
+    if rapport.get("statut") == "ANOMALIE":
+        logger.warning(
+            "Anomalie detectee sur les valeurs de notes : le chargement "
+            "de fait_notes est court-circuite"
+        )
+        return False
+
+    return True
 
 
 
@@ -130,16 +211,6 @@ with DAG(
     catchup=False,
 
 ) as dag:
-
-    submit_spark_job = SparkSubmitOperator(
-        task_id='run_pyspark_job',
-        application='/airflow-dwh-postgres-to-mongodb/dags/spark.py',  # Chemin vers votre script PySpark accessible par le worker
-        conn_id='spark_default',
-        conf={'spark.master': 'spark://spark-master:7077'},
-        verbose=True
-    )
-
-    submit_spark_job
 
     # DIM_ETUDIANT
 
@@ -319,7 +390,10 @@ with DAG(
     """
 
 
-    # FAIT_NOTES
+    # FAIT_NOTES - VERSION SQL CONSERVEE POUR REFERENCE
+    # Cette requete n'est plus executee : fait_notes est desormais produite par
+    # le job PySpark (tache run_pyspark_load). Elle est gardee ici pour comparer les
+    # deux approches et pour documenter le modele sans transformation.
 
     sql_fait_notes = """
 
@@ -470,19 +544,58 @@ with DAG(
     )
 
 
-    # TASK : FAIT_NOTES
+    # TASK : CONTROLE QUALITE (job Spark)
 
-    t_fait_notes = PythonOperator(
+    t_spark_qc = SparkSubmitOperator(
 
-        task_id="load_fait_notes",
+        task_id="run_pyspark_qc",
 
-        python_callable=migrate_table,
+        application=SPARK_APPLICATION,
 
-        op_kwargs={
-            "sql_query": sql_fait_notes,
+        conn_id=SPARK_CONN_ID,
 
-            "mongo_collection": "fait_notes",
-        },
+        application_args=spark_arguments("qc"),
+
+        # jars : distribue le driver JDBC aux executeurs du cluster.
+        # driver_class_path : indispensable en plus, car la lecture JDBC
+        # (creation du DataFrameReader) a lieu dans le driver, et un jar
+        # passe par --jars seul n'y est pas ajoute.
+        jars=SPARK_JDBC_JAR,
+
+        driver_class_path=SPARK_JDBC_JAR,
+
+        verbose=True,
+    )
+
+
+    # TASK : VERIFICATION DU RAPPORT DE QUALITE
+
+    t_check_qualite = ShortCircuitOperator(
+
+        task_id="check_qualite",
+
+        python_callable=check_data_quality,
+    )
+
+
+    # TASK : CHARGEMENT FAIT_NOTES ET INDICATEURS (job Spark)
+    # Remplace l'ancien load_fait_notes en SQL.
+
+    t_spark_load = SparkSubmitOperator(
+
+        task_id="run_pyspark_load",
+
+        application=SPARK_APPLICATION,
+
+        conn_id=SPARK_CONN_ID,
+
+        application_args=spark_arguments("load"),
+
+        jars=SPARK_JDBC_JAR,
+
+        driver_class_path=SPARK_JDBC_JAR,
+
+        verbose=True,
     )
 
 
@@ -496,4 +609,4 @@ with DAG(
         t_temps,
         t_type_evaluation,
 
-    ] >> t_fait_notes
+    ] >> t_spark_qc >> t_check_qualite >> t_spark_load
