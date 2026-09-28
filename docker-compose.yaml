@@ -224,6 +224,53 @@ services:
     restart: unless-stopped
 
 
+  # =========================================================
+  # PGADMIN (interface web PostgreSQL)
+  # =========================================================
+  pgadmin:
+
+    image: dpage/pgadmin4:8
+
+    ports:
+      - "5050:80"
+
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+  # =========================================================
+  # MONGO-EXPRESS (interface web MongoDB)
+  # =========================================================
+  mongo-express:
+
+    image: mongo-express:1.0.2
+
+    ports:
+      - "8082:8081" # 8081 est déjà pris par l'UI Spark
+
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb-dwh
+      ME_CONFIG_MONGODB_PORT: "27017"
+      ME_CONFIG_MONGODB_URL: mongodb://mongodb-dwh:27017/dwh_airflow
+      ME_CONFIG_BASICAUTH: "false" # pas de login demandé
+
+    depends_on:
+      mongodb-dwh:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+
 # ===========================================================
 # VOLUMES
 # ===========================================================
@@ -233,3 +280,4 @@ volumes:
   postgres-db-volume:
   postgres-source-volume:
   mongodb-dwh-volume:
+  pgadmin-data:
